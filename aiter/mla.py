@@ -99,8 +99,8 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q):
             )
             for i in range(1, 17)
         ]
-        num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
-        # num_kv_splits = min(16, max(1, cu_num // bs))
+        # num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
+        num_kv_splits = min(16, max(1, cu_num // bs))
 
     get_mgc = {16: 16, 128: 16}
 

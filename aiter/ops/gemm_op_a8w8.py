@@ -131,6 +131,20 @@ def gemm_a8w8_blockscale_ck(
 ) -> torch.Tensor: ...
 
 
+# compile_ops changed in ROCm/aiter
+@compile_ops(
+        "module_gemm_a8w8_blockscale_v2",
+        fc_name="gemm_a8w8_blockscale",
+        #gen_fake=gen_gemm_a8w8_blockscale_ck_fake_tensors,
+)
+def gemm_a8w8_blockscale_v2(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor: ...
+
 def gen_flatmm_a8w8_blockscale_asm_fake_tensors(
     XQ: Tensor,
     WQ: Tensor,
@@ -358,7 +372,8 @@ def gemm_a8w8_bpreshuffle(
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
-
+import os
+do_gemm_a8w8_blockscale_bruteforce = int(os.getenv('AITER_GEMM_A8W8_BLOCKSCALE_BF', '0'))
 def gemm_a8w8_blockscale(
     XQ: Tensor, WQ: Tensor, x_scale: Tensor, w_scale: Tensor, dtype=dtypes.bf16
 ):
@@ -369,9 +384,15 @@ def gemm_a8w8_blockscale(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
-    get_CKGEMM_config(m, n, k, "a8w8_blockscale_tuned_gemm.csv")
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-    return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+
+    if do_gemm_a8w8_blockscale_bruteforce == 1:
+      get_CKGEMM_config(m, n, k, "a8w8_blockscale_tuned_gemm_bruteforce.csv")
+      Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+      return gemm_a8w8_blockscale_v2(XQ, WQ, x_scale, w_scale, Y)
+    else :
+      get_CKGEMM_config(m, n, k, "a8w8_blockscale_tuned_gemm.csv")
+      Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+      return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
 
 
 def flatmm_a8w8_blockscale_ASM(
@@ -455,3 +476,14 @@ def gemm_a8w8_bpreshuffle_tune(
     kernelId: int = 0,
     splitK: int = 0,
 ) -> None: ...
+
+@compile_ops("module_gemm_a8w8_blockscale_tune_bruteforce", fc_name="gemm_a8w8_blockscale_tune")
+def gemm_a8w8_blockscale_tune_bruteforce(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    kernelId: int = 0,
+    splitK: int = 0,
+) -> torch.Tensor: ...

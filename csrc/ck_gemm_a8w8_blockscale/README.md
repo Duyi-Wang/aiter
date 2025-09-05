@@ -26,3 +26,16 @@ If you have built gemm_a8w8 kernels brefore tuning new GEMM shapes, please add `
 
 ## More
 If you use flag `PREBUILD_KERNELS=1` when you install aiter, it will build gemm a8w8 kernels in tuned gemm csv by default. If you want to use the new result of gemm_a8w8_tune, please remove `build` and `*.so` in `aiter/jit` first, then re-intall aiter after finishing tune. This can take a lot of time and is not recommended.
+
+---
+
+# Bruteforce
+Bruteforce tuning needs `module_gemm_a8w8_blockscale_v2` module. So, you need to follow the steps
+below.
+
+1. Build `module_gemm_a8w8_blockscale_v2` : `AITER_GEMM_A8W8_BLOCKSCALE_BF=1 python csrc/ck_gemm_a8w8_blockscale/manual_build_module.py`
+2. Run bruteforce tuning : `AITER_GEMM_A8W8_BLOCKSCALE_BF=1 python csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune_bruteforce.py`
+
+**Caution) If you have to build bruteforce tuning module, it takes about 4 hours. So we strongly suggest copy the module and build files from our storage.**
+
+Run aiter gemm_a8w8_blockscale API with `AITER_GEMM_A8W8_BLOCKSCALE_BF=1` if you want to use bruteforce-tuned kernel. On the other hand, you can basic tuned kernel by using `AITER_GEMM_A8W8_BLOCKSCALE_BF=0 (default)`.

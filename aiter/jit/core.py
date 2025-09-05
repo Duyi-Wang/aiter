@@ -229,11 +229,11 @@ def rm_module(md_name):
 
 
 @functools.lru_cache()
-def recopy_ck():
-    if os.path.exists(CK_DIR):
-        os.system(f"rm -rf {CK_DIR}")
-    shutil.copytree(CK_3RDPARTY_DIR, CK_DIR, dirs_exist_ok=True)
-    shutil.copy(f"{CK_HELPER_DIR}/config.h", f"{CK_DIR}/include/ck/config.h")
+def recopy_ck(ck_dir=CK_DIR):
+    if os.path.exists(ck_dir):
+        os.system(f"rm -rf {ck_dir}")
+    shutil.copytree(CK_3RDPARTY_DIR, ck_dir, dirs_exist_ok=True)
+    shutil.copy(f"{CK_HELPER_DIR}/config.h", f"{ck_dir}/include/ck/config.h")
 
 
 def clear_build(md_name):
@@ -253,13 +253,14 @@ def build_module(
     is_standalone,
     torch_exclude,
     hipify=True,
+    ck_dir=CK_DIR,
 ):
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
     target_name = f"{md_name}.so" if not is_standalone else md_name
 
     def MainFunc():
-        recopy_ck()
+        recopy_ck(ck_dir)
         if AITER_REBUILD == 1:
             rm_module(md_name)
             clear_build(md_name)
@@ -353,8 +354,8 @@ def build_module(
             )
 
         extra_include_paths = [
-            f"{CK_DIR}/include",
-            f"{CK_DIR}/library/include",
+            f"{ck_dir}/include",
+            f"{ck_dir}/library/include",
             f"{old_bd_include_dir}",
         ]
 

@@ -33,6 +33,7 @@ import re
 import shutil
 import sys
 import os
+import logging
 
 from . import constants
 from .cuda_to_hip_mappings import CUDA_TO_HIP_MAPPINGS
@@ -42,6 +43,7 @@ from typing import Dict, List, Iterator, Optional
 from collections.abc import Mapping, Iterable
 from enum import Enum
 
+logger = logging.getLogger("aiter")
 
 class CurrentState(Enum):
     INITIALIZED = 1
@@ -1343,11 +1345,16 @@ def hipify(
             show_progress,
         )
 
-    print(
+#     print(
+#         bcolors.OKGREEN
+#         + "Successfully preprocessed all matching files."
+#         + bcolors.ENDC,
+#         file=sys.stderr,
+#     )
+    logger.info(
         bcolors.OKGREEN
         + "Successfully preprocessed all matching files."
-        + bcolors.ENDC,
-        file=sys.stderr,
+        + bcolors.ENDC
     )
 
     # Show detailed summary

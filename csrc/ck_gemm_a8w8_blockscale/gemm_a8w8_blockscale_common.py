@@ -69,6 +69,9 @@ class kernelInstance:
             ]
         )
 
+        def __hash__(self):
+            return hash(self.name)
+
 
 kernels_list = {
     # clang-format off

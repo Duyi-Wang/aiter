@@ -111,20 +111,31 @@ void mla_decode_stage1_asm_fwd(
         if(gqa_ratio == 128)
         {
             sub_Q = 128;
-            static AiterAsmKernel impl_a16w16_bf16_subQ128(
-                "_ZN5aiter41mla_dec_stage1_bf16_a16w16_subQ128_mqa128E",
-                "/mla/mla_dec_stage1_bf16_a16w16_subQ128_mqa128.co");
-            impl_ptr = &impl_a16w16_bf16_subQ128;
+            if (KV.dtype() == at::ScalarType::Float8_e4m3fnuz) {
+                static AiterAsmKernel impl_a16w16_bf16_subQ128_fp8(
+                    "_ZN5aiter41mla_dec_stage1_bf16_a16w16_subQ128_mqa128E",
+                    "/mla/mla_dec_stage1_bf16_a16w16_subQ128_mqa128_fp8e4m3fnuz.co");
+                impl_ptr = &impl_a16w16_bf16_subQ128_fp8;
+            } else {
+                static AiterAsmKernel impl_a16w16_bf16_subQ128(
+                    "_ZN5aiter41mla_dec_stage1_bf16_a16w16_subQ128_mqa128E",
+                    "/mla/mla_dec_stage1_bf16_a16w16_subQ128_mqa128.co");
+                impl_ptr = &impl_a16w16_bf16_subQ128;
+            }
         }
         else if(gqa_ratio == 16)
         {
             if(max_seqlen_q == 1)
             {
                 sub_Q = 16;
-                static AiterAsmKernel impl_a16w16_bf16(
-                    "_ZN5aiter39mla_dec_stage1_bf16_a16w16_subQ16_mqa16E",
-                    "/mla/mla_dec_stage1_bf16_a16w16_subQ16_mqa16.co");
-                impl_ptr = &impl_a16w16_bf16;
+                if (KV.dtype() == at::ScalarType::Float8_e4m3fnuz) {
+                    TORCH_CHECK(false, __func__, ":does not support fp8 kv cache for now");
+                } else {
+                    static AiterAsmKernel impl_a16w16_bf16(
+                        "_ZN5aiter39mla_dec_stage1_bf16_a16w16_subQ16_mqa16E",
+                        "/mla/mla_dec_stage1_bf16_a16w16_subQ16_mqa16.co");
+                    impl_ptr = &impl_a16w16_bf16;
+                }
             }
             else if(max_seqlen_q <= 4)
             {

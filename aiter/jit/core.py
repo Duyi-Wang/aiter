@@ -847,8 +847,18 @@ def compile_ops(
                                 raise TypeError(
                                     f"{loadName}: {el} needs to be List[{sub_t}] but got {arg}"
                                 )
+                        elif origin is dict:
+                            if not isinstance(arg, dict):
+                                raise TypeError(
+                                    f"{el} needs to be Dict[{sub_t}] but got {arg}"
+                                )
                         elif origin is typing.Union or origin is types.UnionType:
-                            if arg is not None and not isinstance(arg, sub_t):
+                            if (
+                                arg is not None
+                                and type(arg) is not dict
+                                and type(arg) is not list
+                                and not isinstance(arg, sub_t)
+                            ):
                                 raise TypeError(
                                     f"{loadName}: {el} needs to be Optional[{sub_t}] but got {arg}"
                                 )

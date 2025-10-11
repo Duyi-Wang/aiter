@@ -362,7 +362,11 @@ def get_mla_metadata_v1(
     reduce_indptr: torch.Tensor,
     reduce_final_map: torch.Tensor,
     reduce_partial_map: torch.Tensor,
-    split_params: Optional[dict[str, int]] = None,
+    kv_granularity: int = 16,
+    max_seqlen_qo: int = -1,
+    uni_seqlen_qo: int = -1,
+    fast_mode: bool = False,
+    topk: int = -1,
 ):
     """
     Inputs:
@@ -371,13 +375,11 @@ def get_mla_metadata_v1(
         num_heads_per_head_k: Equals to num_heads_q // num_heads_k.
         num_heads_k: num_heads_k.
         is_causal: whether causal mask is enabled.
-        split_params: detailed settings for spliting. all of them are optional.
-            kv_granularity: default=16. the granularity on kv sequence length when cutting batch.
-            max_seqlen_qo: default=-1. used to check lds usage and save time. value less than 1 means unknown.
-            uni_seqlen_qo: default=-1. sequence length of qo is uniform across batches. value less than 1 means the
-                           length is not fixed.
-            fast_mode: default=0. a non-zero value means user want metadata become as fast as possible. Note that fast
-                       mode may lead to bad overall performance.
+        kv_granularity: the granularity on kv sequence length when cutting batch.
+        max_seqlen_qo: used to check lds usage and save time. value less than 1 means unknown.
+        uni_seqlen_qo: sequence length of qo is uniform across batches. value less than 1 means fixed.
+        fast_mode: when True, metadata generation will be faster but may reduce overall performance.
+        topk: top-k value for attention computation (-1 means no top-k).
     Outputs:
         [0] work_metadata_ptrs  (2)                 Two 64-bits pointers point to the 1st element of work_indptr and
                                                     work_info.

@@ -367,7 +367,7 @@ def get_mla_metadata_v1(
     uni_seqlen_qo: int = -1,
     fast_mode: bool = False,
     topk: int = -1,
-):
+) -> None:
     """
     Inputs:
         cumulated seqlens of q/o: (batch_size + 1), dtype torch.int32.
@@ -452,4 +452,4 @@ def mla_reduce_v1(
     reduce_partial_map: torch.Tensor,
     final_output: torch.Tensor,
     final_lse: Optional[torch.Tensor] = None,
-): ...
+) -> None: ...

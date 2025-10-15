@@ -195,10 +195,10 @@ def fused_qk_rope_cat_and_cache_mla(
     - q_out: The output matrix with shape (B, QH, D1+D2).
     - kv_cache: The output matrix with shape (B_max, KH, D1 + D2) (inplace).
     """
-    _LOGGER.info(
-        f"FUSED_QK_ROPE_CAT_AND_CACHE_MLA: q_nope={tuple(q_nope.shape)} q_pe={tuple(q_pe.shape)} k_nope={tuple(k_nope.shape)} k_pe={tuple(k_pe.shape)} "
-        + f"pos={tuple(pos.shape)} cos={tuple(cos.shape)} sin={tuple(sin.shape)} kv_cache={tuple(kv_cache.shape)} slot_mapping={tuple(slot_mapping.shape)}"
-    )
+    # _LOGGER.info(
+    #     f"FUSED_QK_ROPE_CAT_AND_CACHE_MLA: q_nope={tuple(q_nope.shape)} q_pe={tuple(q_pe.shape)} k_nope={tuple(k_nope.shape)} k_pe={tuple(k_pe.shape)} "
+    #     + f"pos={tuple(pos.shape)} cos={tuple(cos.shape)} sin={tuple(sin.shape)} kv_cache={tuple(kv_cache.shape)} slot_mapping={tuple(slot_mapping.shape)}"
+    # )
 
     b, qh, d_nope = q_nope.shape
     b2, qh2, d_pe = q_pe.shape

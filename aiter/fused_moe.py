@@ -30,6 +30,27 @@ from aiter.utility import fp4_utils
 from aiter.ops.flydsl.utils import is_flydsl_available
 
 BLOCK_SIZE_M = 32
+import math
+from typing import Dict, Tuple
+
+_tmp_out_cache: Dict[Tuple[int, ...], torch.Tensor] = {}
+_tmp_out_cache: Dict[Tuple[int, int, int, str, int], torch.Tensor] = {}  
+_max_cache_size = 256 
+  
+def _get_tmp_out_cached(shape: Tuple[int, int, int],dtype: torch.dtype,device: torch.device) -> torch.Tensor:  
+    """单线程环境下的缓存实现"""  
+    key = (*shape, str(device), dtype.itemsize)  
+      
+    if key in _tmp_out_cache:  
+        return _tmp_out_cache[key]  
+      
+    if len(_tmp_out_cache) >= _max_cache_size:  
+        oldest_key = next(iter(_tmp_out_cache))  
+        del _tmp_out_cache[oldest_key]  
+      
+    buffer = torch.empty(shape, dtype=dtype, device=device)  
+    _tmp_out_cache[key] = buffer  
+    return buffer
 
 _USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
 
@@ -1638,11 +1659,20 @@ def ck_moe_stage1(
 ):
     token_num = hidden_states.shape[0]
     is_splitk = quant_type is aiter.QuantType.per_1x128 and splitk > 1
+    # After (persistent buffer, reuses allocation):
+    # tmp_out = (
+    #     _get_tmp_out_cached(
+    #         (token_num, topk, w1.shape[1]), dtype=dtypes.fp32, device=out.device
+    #     )
+    #     if is_splitk
+    #     else out
+    # )
+    #TODO
     tmp_out = (
         torch.zeros(
             (token_num, topk, w1.shape[1]), dtype=dtypes.fp32, device=out.device
         )
-        if is_splitk
+        if splitk > 1
         else out
     )
     aiter.ck_moe_stage1_fwd(

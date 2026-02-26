@@ -48,7 +48,6 @@
     "NUM_KSPLIT": 1
   },
   "M_LEQ_128": {
-<<<<<<< HEAD
       "BLOCK_SIZE_M": 64,
       "BLOCK_SIZE_N": 32,
       "BLOCK_SIZE_K": 128,
@@ -59,18 +58,6 @@
       "matrix_instr_nonkdim": 32,
       "cache_modifier": null,
       "NUM_KSPLIT": 1
-=======
-    "BLOCK_SIZE_M": 32,
-    "BLOCK_SIZE_N": 32,
-    "BLOCK_SIZE_K": 128,
-    "GROUP_SIZE_M": 4,
-    "num_warps": 1,
-    "num_stages": 2,
-    "waves_per_eu": 1,
-    "matrix_instr_nonkdim": 16,
-    "cache_modifier": null,
-    "NUM_KSPLIT": 1
->>>>>>> ink/optim_tp
   },
   "any": {
     "BLOCK_SIZE_M": 64,

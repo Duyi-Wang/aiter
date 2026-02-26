@@ -1537,11 +1537,19 @@ def ck_moe_stage1(
     token_num = hidden_states.shape[0]
     is_splitk = quant_type is aiter.QuantType.per_1x128 and splitk > 1
     # After (persistent buffer, reuses allocation):
+    # tmp_out = (
+    #     _get_tmp_out_cached(
+    #         (token_num, topk, w1.shape[1]), dtype=dtypes.fp32, device=out.device
+    #     )
+    #     if is_splitk
+    #     else out
+    # )
+    #TODO
     tmp_out = (
-        _get_tmp_out_cached(
+        torch.zeros(
             (token_num, topk, w1.shape[1]), dtype=dtypes.fp32, device=out.device
         )
-        if is_splitk
+        if splitk > 1
         else out
     )
     aiter.ck_moe_stage1_fwd(

@@ -239,6 +239,7 @@ def mla_decode_fwd(
             logits,
             attn_lse,
             o,
+            None,
             q_scale,
             kv_scale,
         )
@@ -358,6 +359,7 @@ def mla_decode_fwd(
             logits,
             attn_lse,
             o,
+                final_lse,
             q_scale,
             kv_scale,
         )
@@ -380,8 +382,9 @@ def mla_decode_fwd(
         if max_seqlen_q == 1:
             q = q.view(ori_total_s, ori_nhead, -1)
             o = o.view(ori_total_s, ori_nhead, -1)
+            if final_lse is not None:
+                final_lse = final_lse.view(ori_total_s, ori_nhead)
         else:
-            # for test, q need to be transpose into the original shape
             new_o = (
                 o.reshape(
                     ori_total_s // max_seqlen_q,
@@ -396,6 +399,19 @@ def mla_decode_fwd(
             )
             o_orig.set_(new_o)
             o = o_orig
+
+            if final_lse is not None:
+                final_lse = (
+                    final_lse.reshape(
+                        ori_total_s // max_seqlen_q,
+                        ori_nhead // nhead,
+                        max_seqlen_q,
+                        nhead,
+                    )
+                    .permute(0, 2, 1, 3)
+                    .reshape(ori_total_s, ori_nhead)
+                    .contiguous()
+                )
 
     return logits, final_lse
 

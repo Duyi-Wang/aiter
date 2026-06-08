@@ -1070,7 +1070,7 @@ def get_2stage_cfgs(
     # EP convention: callers append one always-masked fake-expert slot to
     # topk_ids, so runtime `topk` is routed_topk + 1. Tuned configs are keyed
     # on routed_topk; strip the fake slot before building the lookup key.
-    topk -= int(is_ep)
+    # topk -= int(is_ep)
     keys = (
         cu_num,
         token,

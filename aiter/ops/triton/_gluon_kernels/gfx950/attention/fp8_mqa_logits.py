@@ -785,6 +785,7 @@ def _gluon_fp8_mqa_logits_kernel(
     USE_PADDED_SHARED_LAYOUT: gl.constexpr,
     BLOCK_M: gl.constexpr = 1,  # query rows per workgroup
     MFMA_NONK_DIM: gl.constexpr = 32,
+    LOGITS_COL_ZERO: gl.constexpr = False,
 ):
 
     gl.static_assert(
@@ -910,9 +911,16 @@ def _gluon_fp8_mqa_logits_kernel(
 
     # Bake row + start offsets into the base pointers
     kv_scales_ptr_seg = kv_scales_ptr + union_start
-    logits_ptr_row = (
-        logits_ptr + row_id * stride_logits_s + union_start * stride_logits_k
-    )
+    # Decouple the logits write column from the KV read offset. When
+    # LOGITS_COL_ZERO is set, cu_start/cu_end address KV in a shared (batched)
+    # K_all buffer while each row still writes its segment column-0 aligned,
+    # yielding a [seq_len, max_seg_len] output that topk consumes unchanged.
+    if LOGITS_COL_ZERO:
+        logits_ptr_row = logits_ptr + row_id * stride_logits_s
+    else:
+        logits_ptr_row = (
+            logits_ptr + row_id * stride_logits_s + union_start * stride_logits_k
+        )
 
     mqa_logits_loop_double_buf(
         kv_loader,

@@ -2996,10 +2996,6 @@ def get_2stage_cfgs(
             cfg_2stages_by_file[tune_file] = active_cfg_2stages
     cu_num = get_cu_num()
     gfx = get_gfx_runtime()
-    # EP convention: callers append one always-masked fake-expert slot to
-    # topk_ids, so runtime `topk` is routed_topk + 1. Tuned configs are keyed
-    # on routed_topk; strip the fake slot before building the lookup key.
-    topk -= int(is_ep)
     keys = (
         gfx,
         cu_num,
@@ -3058,14 +3054,15 @@ def get_2stage_cfgs(
         )
         logger.info("\033[0m")
 
-    def _lookup_cfg(c2s):
+    def _lookup_cfg_for_topk(c2s, config_topk):
         if not c2s:
             return None
         primary, fallback = c2s
-        lookup_keys = keys[:7] + (str(activation),) + keys[8:]
+        lookup_keys = keys[:6] + (config_topk, str(activation)) + keys[8:]
+        lookup_disabled = keys_disabled[:6] + (config_topk,) + keys_disabled[7:]
         result = primary.get(lookup_keys, None)
         if result is None and config_file is None:
-            result = fallback.get(keys_disabled, None)
+            result = fallback.get(lookup_disabled, None)
         # Tier fallback: if current tier not found, try smaller tiers in descending order
         if result is None and config_file is None and token > _PADDED_M_TIERS[0]:
             tier_idx = _PADDED_M_TIERS.index(token) if token in _PADDED_M_TIERS else -1
@@ -3073,13 +3070,27 @@ def get_2stage_cfgs(
                 # keys layout: (gfx, cu_num, token, ...); replace token (idx 2).
                 keys_fb = lookup_keys[:2] + (fallback_tier,) + lookup_keys[3:]
                 keys_fb_disabled = (
-                    keys_disabled[:2] + (fallback_tier,) + keys_disabled[3:]
+                    lookup_disabled[:2] + (fallback_tier,) + lookup_disabled[3:]
                 )
                 result = primary.get(keys_fb, None)
                 if result is None:
                     result = fallback.get(keys_fb_disabled, None)
                 if result is not None:
                     break
+        return result
+
+    def _lookup_cfg(c2s):
+        # Prefer the actual routing width, including real shared experts.
+        result = _lookup_cfg_for_topk(c2s, topk)
+        if result is None and is_ep and topk > 1 and config_file is None:
+            # Legacy callers may append a masked column. Reuse their tuning
+            # row only as a fallback; keep runtime topk for all kernel checks.
+            result = _lookup_cfg_for_topk(c2s, topk - 1)
+            if result is not None:
+                logger.debug(
+                    f"[fused_moe] runtime topk={topk}: found legacy EP tuning "
+                    f"row with topk={topk - 1}"
+                )
         return result
 
     cfg = _lookup_cfg(active_cfg_2stages)

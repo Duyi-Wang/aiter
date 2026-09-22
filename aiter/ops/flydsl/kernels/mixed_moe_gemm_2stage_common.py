@@ -259,7 +259,7 @@ def compile_mixed_moe_gemm1_common(
     go_tag = "_go" if mock_gate_only else ""
     gui_tag = "_gui" if gate_up_interleave else ""
     as1_tag = "_as1" if a_scale_one else ""
-    xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
+    xcd_tag = f"_xcd{xcd_swizzle}_balanced" if xcd_swizzle > 0 else ""
     v2out_tag = "_v2out" if v2_output_layout else ""
     # Keep the historical name for silu; swiglu/situv2 get distinct symbols so
     # they cannot alias. SiTUv2 beta values are runtime kernel arguments and
@@ -528,8 +528,16 @@ def compile_mixed_moe_gemm1_common(
                 num_workgroups = grid_x * grid_y
                 num_xcds_idx = arith.constant(num_xcds, index=True)
                 workgroups_per_xcd = num_workgroups // num_xcds_idx
-                workgroup_id = (linear_id % num_xcds_idx) * workgroups_per_xcd + (
-                    linear_id // num_xcds_idx
+                xcd_id = linear_id % num_xcds_idx
+                remainder = num_workgroups % num_xcds_idx
+                # The first remainder XCD ranges each contain one extra CTA.
+                extra_prefix = (fx.Index(xcd_id) < fx.Index(remainder)).select(
+                    xcd_id, remainder
+                )
+                workgroup_id = (
+                    xcd_id * workgroups_per_xcd
+                    + extra_prefix
+                    + linear_id // num_xcds_idx
                 )
                 group_m = arith.constant(xcd_swizzle, index=True)
                 workgroups_per_group = group_m * grid_x
@@ -3327,7 +3335,7 @@ def compile_mixed_moe_gemm2_common(
     async_tag = "_async" if use_async_copy else ""
     cumul_tag = f"_cumul{int(cu_num_mul)}" if int(cu_num_mul) != 1 else ""
     acc_tag = "" if accumulate else "_acc0"
-    xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
+    xcd_tag = f"_xcd{xcd_swizzle}_balanced" if xcd_swizzle > 0 else ""
     heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
     serial_n_tag = "_serialn128" if serial_shared_n else ""
     if heterogeneous_b:
@@ -3440,8 +3448,16 @@ def compile_mixed_moe_gemm2_common(
                 num_workgroups = grid_x * grid_y
                 num_xcds_idx = arith.constant(num_xcds, index=True)
                 workgroups_per_xcd = num_workgroups // num_xcds_idx
-                workgroup_id = (linear_id % num_xcds_idx) * workgroups_per_xcd + (
-                    linear_id // num_xcds_idx
+                xcd_id = linear_id % num_xcds_idx
+                remainder = num_workgroups % num_xcds_idx
+                # The first remainder XCD ranges each contain one extra CTA.
+                extra_prefix = (fx.Index(xcd_id) < fx.Index(remainder)).select(
+                    xcd_id, remainder
+                )
+                workgroup_id = (
+                    xcd_id * workgroups_per_xcd
+                    + extra_prefix
+                    + linear_id // num_xcds_idx
                 )
                 group_m = arith.constant(xcd_swizzle, index=True)
                 workgroups_per_group = group_m * grid_x

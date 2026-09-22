@@ -3,24 +3,6 @@
 
 """Shared MXFP4/FP8 MoE and heterogeneous MoE kernel builders."""
 
-"""MoE GEMM stage1/stage2 kernel implementations (FlyDSL MFMA FP8/FP16/FP4).
-
-This module contains the **kernel builder code** for:
-- `moe_gemm1` (stage1, with silu/swiglu activation)
-- `moe_gemm2` (stage2)
-
-It is extracted from `tests/kernels/test_moe_gemm.py` so that:
-- `kernels/` holds the implementation
-- `tests/` holds correctness/perf harnesses
-
-Mixed-precision support (a_dtype x b_dtype):
-- fp8 x fp8, fp8 x fp4 (A8W4 on gfx950), fp4 x fp4,
-  fp16 x fp16, int8 x int4, ...
-
-A8W4 path is selected by `a_dtype='fp8', b_dtype='fp4'` plus
-`gate_mode=GateMode.INTERLEAVE` + `a_scale_one=True` in stage1.
-"""
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -255,6 +237,18 @@ def compile_mixed_moe_gemm1_common(
     need_fp8 = out_dtype == "fp8"
     need_quant = need_fp4 or need_fp8
     need_sort = need_quant
+    # Drain asynchronous copies before this tile's LDS buffer is reused.
+    sync_lds_turnover = (
+        is_f8_a
+        and is_f4_b
+        and gate_up_interleave
+        and (need_fp8 or out_is_bf16)
+        and not is_splitk
+        and not heterogeneous_b
+        and use_async_copy
+        and (model_dim, inter_dim, experts) == (7168, 3072, 48)
+        and (tile_m, tile_n, tile_k, k_wave) == (32, 128, 256, 1)
+    )
 
     fp4q_tag = "_fp4q" if need_fp4 else ""
     fp8q_tag = "_fp8q" if need_fp8 else ""
@@ -275,9 +269,10 @@ def compile_mixed_moe_gemm1_common(
     # ABI v33 adds four runtime SiTUv2 beta scalars; heterogeneous ABI tracks one
     # version ahead of the ordinary kernel.
     kernel_version = 34 if heterogeneous_b else 33
+    lds_wait_tag = "_sync_lds" if sync_lds_turnover else ""
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}{lds_wait_tag}_v{kernel_version}"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -1532,7 +1527,10 @@ def compile_mixed_moe_gemm1_common(
                     k_off = sk * layout_b_scale.stride_k0
 
                     rocdl.sched_barrier(0)
-                    if const_expr(heterogeneous_b and use_async_copy):
+                    if const_expr(sync_lds_turnover):
+                        rocdl.s_waitcnt(0)
+                        gpu.barrier()
+                    elif const_expr(heterogeneous_b and use_async_copy):
                         barrier(vmcnt=0)
                     else:
                         rocdl.s_waitcnt(body_vmcnt_before_barrier)

@@ -50,8 +50,9 @@ from aiter.ops.flydsl.moe_kernels import (
     get_flydsl_kernel_params,
     requires_flydsl_stage2_global_a,
     requires_flydsl_stage2_reduce,
-    resolve_flydsl_grid_y_persist_m,
+    resolve_flydsl_stage1_persist_m,
     resolve_flydsl_stage1_tile_n,
+    resolve_flydsl_stage2_persist_m,
     resolve_flydsl_stage2_tile_k,
     runtime_swiglu_limit,
 )
@@ -245,10 +246,9 @@ def _precompile_to_cache(
     stage1_fuse_quant=None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
-    # Stage2-only kernel tuning knobs (registered by the production-variant
-    # entries in `get_flydsl_stage2_kernels`). Forwarded into
-    # `compile_flydsl_moe_stage2` for stage 2 AOT compilation.
+    # Stage2 async-copy option; fused-MoE stage1 always uses async copies.
     use_async_copy: bool = False,
+    # Worker multiplier for persistent stage1 and stage2.
     cu_num_mul: int = 1,
     _aot_backend=None,
     **kwargs,
@@ -614,6 +614,7 @@ def _precompile_to_cache(
                 b_dtype=b_dtype,
                 out_dtype=_gemm_out_dtype,
                 act=act,
+                persist_m=resolve_flydsl_stage1_persist_m(_grid_y, persist=persist),
                 use_async_copy=True,
                 k_batch=k_batch,
                 waves_per_eu=waves_per_eu,
@@ -624,6 +625,7 @@ def _precompile_to_cache(
                 xcd_swizzle=xcd_swizzle,
                 k_wave=k_wave,
                 v2_output_layout=_v2_output_layout,
+                **({"cu_num_mul": cu_num_mul} if cu_num_mul != 1 else {}),
             )
             _run_compiled(exe, args)
 
@@ -730,14 +732,7 @@ def _precompile_to_cache(
             else:
                 total_sorted = sorted_expert_ids.shape[0] * _sbm
                 m_blocks = (total_sorted + tile_m - 1) // tile_m
-            if persist is True:
-                _persist_m = -1
-            elif persist is False:
-                _persist_m = 4 if m_blocks > 256 else 1
-            else:
-                _persist_m = -1 if m_blocks > 256 else 1
-            if a_dtype == "fp8":
-                _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
+            _persist_m = resolve_flydsl_stage2_persist_m(m_blocks, a_dtype, persist)
 
             _n_in = model_dim
             _k_in = inter_dim

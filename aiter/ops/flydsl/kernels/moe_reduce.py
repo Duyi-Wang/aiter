@@ -37,6 +37,7 @@ def _moe_reduction_body(
     expert_mask: fx.Pointer,
     topk_ids: fx.Pointer,
     topk_weights: fx.Pointer,
+    num_valid_ids: fx.Pointer,
     i32_m_tokens: fx.Int32,
     topk: fx.Constexpr[int],
     model_dim: fx.Constexpr[int],
@@ -48,6 +49,7 @@ def _moe_reduction_body(
     scale_blk: fx.Constexpr[int],
     fp8_row_stride: fx.Constexpr[int],
     NTHREADS: fx.Constexpr[int],
+    persistent_cus: fx.Constexpr[int],
 ):
     # One tiled-copy reduce for every dtype. Dense (f16/bf16/f32) loads V elems
     # and extends to f32; fp8 route-out loads 8 fp8 bytes + their e8m0 microscale
@@ -74,121 +76,143 @@ def _moe_reduction_body(
     TILE = NTHREADS * V
     store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), out_numeric)
 
-    token, tile, tid = gpu.block_id("x"), gpu.block_id("y"), gpu.thread_id("x")
-    tok64 = fx.Int64(token)
+    worker, tile, tid = gpu.block_id("x"), gpu.block_id("y"), gpu.thread_id("x")
 
-    def _view(elem, ptr_i64, ncols, nbytes):  # 2D [1, ncols] V# buffer descriptor
-        pt = fx.PointerType.get(
-            elem.ir_type,
-            address_space=fx.AddressSpace.Global,
-            alignment=elem.width // 8,
-        )
-        view = fx.make_view(
-            fx.inttoptr(pt, ptr_i64), fx.make_layout((1, ncols), (ncols, 1))
-        )
-        return fx.rocdl.make_buffer_tensor(view, num_records_bytes=fx.Int64(nbytes))
+    @flyc.jit
+    def _reduce_token(token):
+        tok64 = fx.Int64(token)
 
-    # Fold the per-token byte offset into the base ptr: keeps voffsets i32-safe
-    # for X > 4 GiB.
-    x_row_bytes = topk * row_stride * in_bytes
-    xbase = fx.Int64(ptrtoint(X)) + tok64 * fx.Int64(x_row_bytes)
-    xbuf = _view(in_elem, xbase, model_dim, x_row_bytes)
-    ybuf = _view(
-        out_numeric,
-        fx.Int64(ptrtoint(Y)) + tok64 * fx.Int64(model_dim * out_bytes),
-        model_dim,
-        model_dim * out_bytes,
-    )
-    if const_expr(is_fp8):
-        # e8m0 scales trail the values in each row (one byte per scale_blk elems).
-        i8pt = fx.PointerType.get(
-            fx.Int8.ir_type, address_space=fx.AddressSpace.Global, alignment=1
+        def _view(elem, ptr_i64, ncols, nbytes):  # 2D [1, ncols] V# buffer descriptor
+            pt = fx.PointerType.get(
+                elem.ir_type,
+                address_space=fx.AddressSpace.Global,
+                alignment=elem.width // 8,
+            )
+            view = fx.make_view(
+                fx.inttoptr(pt, ptr_i64), fx.make_layout((1, ncols), (ncols, 1))
+            )
+            return fx.rocdl.make_buffer_tensor(view, num_records_bytes=fx.Int64(nbytes))
+
+        # Fold the per-token byte offset into the base ptr: keeps voffsets i32-safe
+        # for X > 4 GiB.
+        x_row_bytes = topk * row_stride * in_bytes
+        xbase = fx.Int64(ptrtoint(X)) + tok64 * fx.Int64(x_row_bytes)
+        xbuf = _view(in_elem, xbase, model_dim, x_row_bytes)
+        ybuf = _view(
+            out_numeric,
+            fx.Int64(ptrtoint(Y)) + tok64 * fx.Int64(model_dim * out_bytes),
+            model_dim,
+            model_dim * out_bytes,
         )
-        sc_ptr = fx.inttoptr(i8pt, xbase + fx.Int64(model_dim))
-    if const_expr(use_mask):
+        if const_expr(is_fp8):
+            # e8m0 scales trail the values in each row (one byte per scale_blk elems).
+            i8pt = fx.PointerType.get(
+                fx.Int8.ir_type, address_space=fx.AddressSpace.Global, alignment=1
+            )
+            sc_ptr = fx.inttoptr(i8pt, xbase + fx.Int64(model_dim))
+        if const_expr(use_mask):
+            i32pt = fx.PointerType.get(
+                T.i32, address_space=fx.AddressSpace.Global, alignment=4
+            )
+            tk_ptr = fx.inttoptr(
+                i32pt, fx.Int64(ptrtoint(topk_ids)) + tok64 * fx.Int64(topk * 4)
+            )
+            em_ptr = fx.inttoptr(i32pt, fx.Int64(ptrtoint(expert_mask)))
+        if const_expr(use_weight):
+            # Route weights deferred from the stage2 epilogue: scale each expert's
+            # contribution here instead, so the GEMM stores unweighted rows.
+            f32pt = fx.PointerType.get(
+                T.f32, address_space=fx.AddressSpace.Global, alignment=4
+            )
+            tw_ptr = fx.inttoptr(
+                f32pt, fx.Int64(ptrtoint(topk_weights)) + tok64 * fx.Int64(topk * 4)
+            )
+
+        # Tiled copy: NTHREADS threads across the tile, V contiguous elems per thread.
+        tile_mn, tv_layout = fx.make_layout_tv(
+            fx.make_layout((1, NTHREADS), (1, 1)), fx.make_layout((1, V), (1, 1))
+        )
+        thr_load = fx.make_tiled_copy(load_atom, tv_layout, tile_mn).get_slice(tid)
+        thr_store = fx.make_tiled_copy(store_atom, tv_layout, tile_mn).get_slice(tid)
+
+        def _decode_fp8(vfrag, scale):  # 8 fp8 bytes + its e8m0 scale -> Vector(8, f32)
+            w = fx.Vector(fx.memref_load_vec(vfrag)).bitcast(fx.Int32)
+            words = (w[0], w[0], w[1], w[1])
+            lanes = []
+            for pi in range_constexpr(4):
+                pair = fx.Vector(
+                    fx.rocdl.cvt_pk_f32_fp8(T.f32x2, words[pi], bool(pi & 1))
+                )
+                lanes.append(pair[0] * scale)
+                lanes.append(pair[1] * scale)
+            return fx.Vector.from_elements(lanes, fx.Float32)
+
+        def _reduce_tile():
+            p_src = thr_load.partition_S(
+                fx.slice(fx.zipped_divide(xbuf, tile_mn), (None, (0, tile)))
+            )
+            p_dst = thr_store.partition_D(
+                fx.slice(fx.zipped_divide(ybuf, tile_mn), (None, (0, tile)))
+            )
+            # topk rows share one per-thread voffset via a uniform scalar
+            # soffset = k*row_stride, so the loads issue back-to-back.
+            frags = [fx.make_fragment_like(p_src) for _ in range_constexpr(topk)]
+            for k in range_constexpr(topk):
+                fx.copy(load_atom, p_src, frags[k], soffset=fx.Int32(k * row_stride))
+            if const_expr(is_fp8):
+                sc_col = (
+                    fx.Int32(tile) * fx.Int32(TILE) + fx.Int32(tid) * fx.Int32(V)
+                ) // fx.Int32(scale_blk)
+                scales = []
+                for k in range_constexpr(topk):
+                    e8m0 = fx.Uint32(
+                        fx.Uint8(sc_ptr[sc_col + fx.Int32(k * row_stride)])
+                    )
+                    scales.append((e8m0 << fx.Uint32(23)).bitcast(fx.Float32))
+
+            acc = fx.Vector.filled(V, 0.0, fx.Float32)
+            for k in range_constexpr(topk):
+                if const_expr(is_fp8):
+                    vk = _decode_fp8(frags[k], scales[k])
+                else:
+                    vk = fx.Vector(fx.memref_load_vec(frags[k])).to(fx.Float32)
+                if const_expr(use_weight):
+                    wk = tw_ptr[k]
+                    vk = fx.Vector.from_elements(
+                        [vk[i] * wk for i in range_constexpr(V)], fx.Float32
+                    )
+                if const_expr(use_mask):
+                    vk = (em_ptr[tk_ptr[k]] != fx.Int32(0)).select(
+                        vk, fx.Vector.filled(V, 0.0, fx.Float32)
+                    )
+                acc = acc + vk
+            ofrag = fx.make_fragment_like(p_dst)
+            fx.memref_store_vec(acc.to(out_numeric), ofrag)
+            fx.copy(store_atom, ofrag, p_dst)
+
+        # Skip column groups beyond model_dim.
+        if const_expr(model_dim % TILE != 0):
+            if fx.Int32(tile) * fx.Int32(TILE) + fx.Int32(tid) * fx.Int32(V) < fx.Int32(
+                model_dim
+            ):
+                _reduce_tile()
+        else:
+            _reduce_tile()
+
+    if const_expr(persistent_cus > 0):
         i32pt = fx.PointerType.get(
             T.i32, address_space=fx.AddressSpace.Global, alignment=4
         )
-        tk_ptr = fx.inttoptr(
-            i32pt, fx.Int64(ptrtoint(topk_ids)) + tok64 * fx.Int64(topk * 4)
-        )
-        em_ptr = fx.inttoptr(i32pt, fx.Int64(ptrtoint(expert_mask)))
-    if const_expr(use_weight):
-        # Route weights deferred from the stage2 epilogue: scale each expert's
-        # contribution here instead, so the GEMM stores unweighted rows.
-        f32pt = fx.PointerType.get(
-            T.f32, address_space=fx.AddressSpace.Global, alignment=4
-        )
-        tw_ptr = fx.inttoptr(
-            f32pt, fx.Int64(ptrtoint(topk_weights)) + tok64 * fx.Int64(topk * 4)
-        )
-
-    # Tiled copy: NTHREADS threads across the tile, V contiguous elems per thread.
-    tile_mn, tv_layout = fx.make_layout_tv(
-        fx.make_layout((1, NTHREADS), (1, 1)), fx.make_layout((1, V), (1, 1))
-    )
-    thr_load = fx.make_tiled_copy(load_atom, tv_layout, tile_mn).get_slice(tid)
-    thr_store = fx.make_tiled_copy(store_atom, tv_layout, tile_mn).get_slice(tid)
-
-    def _decode_fp8(vfrag, scale):  # 8 fp8 bytes + its e8m0 scale -> Vector(8, f32)
-        w = fx.Vector(fx.memref_load_vec(vfrag)).bitcast(fx.Int32)
-        words = (w[0], w[0], w[1], w[1])
-        lanes = []
-        for pi in range_constexpr(4):
-            pair = fx.Vector(fx.rocdl.cvt_pk_f32_fp8(T.f32x2, words[pi], bool(pi & 1)))
-            lanes.append(pair[0] * scale)
-            lanes.append(pair[1] * scale)
-        return fx.Vector.from_elements(lanes, fx.Float32)
-
-    def _reduce_tile():
-        p_src = thr_load.partition_S(
-            fx.slice(fx.zipped_divide(xbuf, tile_mn), (None, (0, tile)))
-        )
-        p_dst = thr_store.partition_D(
-            fx.slice(fx.zipped_divide(ybuf, tile_mn), (None, (0, tile)))
-        )
-        # topk rows share one per-thread voffset via a uniform scalar
-        # soffset = k*row_stride, so the loads issue back-to-back.
-        frags = [fx.make_fragment_like(p_src) for _ in range_constexpr(topk)]
-        for k in range_constexpr(topk):
-            fx.copy(load_atom, p_src, frags[k], soffset=fx.Int32(k * row_stride))
-        if const_expr(is_fp8):
-            sc_col = (
-                fx.Int32(tile) * fx.Int32(TILE) + fx.Int32(tid) * fx.Int32(V)
-            ) // fx.Int32(scale_blk)
-            scales = []
-            for k in range_constexpr(topk):
-                e8m0 = fx.Uint32(fx.Uint8(sc_ptr[sc_col + fx.Int32(k * row_stride)]))
-                scales.append((e8m0 << fx.Uint32(23)).bitcast(fx.Float32))
-
-        acc = fx.Vector.filled(V, 0.0, fx.Float32)
-        for k in range_constexpr(topk):
-            if const_expr(is_fp8):
-                vk = _decode_fp8(frags[k], scales[k])
-            else:
-                vk = fx.Vector(fx.memref_load_vec(frags[k])).to(fx.Float32)
-            if const_expr(use_weight):
-                wk = tw_ptr[k]
-                vk = fx.Vector.from_elements(
-                    [vk[i] * wk for i in range_constexpr(V)], fx.Float32
-                )
-            if const_expr(use_mask):
-                vk = (em_ptr[tk_ptr[k]] != fx.Int32(0)).select(
-                    vk, fx.Vector.filled(V, 0.0, fx.Float32)
-                )
-            acc = acc + vk
-        ofrag = fx.make_fragment_like(p_dst)
-        fx.memref_store_vec(acc.to(out_numeric), ofrag)
-        fx.copy(store_atom, ofrag, p_dst)
-
-    # Skip column groups beyond model_dim.
-    if const_expr(model_dim % TILE != 0):
-        if fx.Int32(tile) * fx.Int32(TILE) + fx.Int32(tid) * fx.Int32(V) < fx.Int32(
-            model_dim
-        ):
-            _reduce_tile()
+        counts = fx.inttoptr(i32pt, fx.Int64(ptrtoint(num_valid_ids)))
+        # Sorting's second count is live packed rows. Check it before any row
+        # load, including top-k metadata, so stale padding cannot enter reduction.
+        live_tokens = fx.Int32(fx.rocdl.readfirstlane(T.i32, counts[1].ir_value()))
+        live_tokens = (live_tokens > fx.Int32(0)).select(live_tokens, fx.Int32(0))
+        live_tokens = (live_tokens < i32_m_tokens).select(live_tokens, i32_m_tokens)
+        for token in range(fx.Int32(worker), live_tokens, fx.Int32(persistent_cus)):
+            _reduce_token(token)
     else:
-        _reduce_tile()
+        _reduce_token(worker)
 
 
 def _pick_reduce_block(model_dim: int, V: int) -> int:
@@ -211,13 +235,15 @@ def compile_moe_reduction(
     use_weight: bool = False,
     scale_blk: int | None = None,
     pitch_align: int | None = None,
+    use_token_limit: bool = False,
 ):
     """Compile the topk-reduce launcher for one Constexpr set (cached per shape).
 
     Returns a ``@flyc.jit`` taking ``(X, Y, expert_mask, topk_ids, topk_weights,
     i32_m_tokens, stream)``; dispatch it through ``moe_kernels._run_compiled``. The
     launcher is a distinct object per shape, so the shim's per-exe ``_cf`` cache
-    stays correct.
+    stays correct. With use_token_limit, insert a device num_valid_ids pointer
+    before i32_m_tokens; entry1 bounds the live packed rows and the grid is CU-sized.
     """
     V = FP8_VEC if dtype_str == "fp8" else 128 // (32 if dtype_str == "f32" else 16)
     block = _pick_reduce_block(model_dim, V)
@@ -234,10 +260,17 @@ def compile_moe_reduction(
     else:
         scale_blk, fp8_row_stride = FP8_VEC, model_dim
 
+    if use_token_limit:
+        from aiter.jit.utils.chip_info import get_cu_num
+
+        persistent_cus = get_cu_num()
+    else:
+        persistent_cus = 0
     kernel_name = (
         f"moe_reduction_{dtype_str}_{out_tag}_t{topk}_n{model_dim}"
         f"_m{int(use_mask)}e{num_experts if use_mask else 0}"
         f"_w{int(use_weight)}_s{scale_blk}_r{fp8_row_stride}_b{block}"
+        f"_live{int(use_token_limit)}_cu{persistent_cus}_v1"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -247,6 +280,7 @@ def compile_moe_reduction(
         expert_mask: fx.Pointer,
         topk_ids: fx.Pointer,
         topk_weights: fx.Pointer,
+        num_valid_ids: fx.Pointer,
         i32_m_tokens: fx.Int32,
     ):
         _moe_reduction_body(
@@ -255,6 +289,7 @@ def compile_moe_reduction(
             expert_mask,
             topk_ids,
             topk_weights,
+            num_valid_ids,
             i32_m_tokens,
             topk,
             model_dim,
@@ -266,7 +301,33 @@ def compile_moe_reduction(
             scale_blk,
             fp8_row_stride,
             block,
+            persistent_cus,
         )
+
+    if use_token_limit:
+
+        @flyc.jit
+        def launch_limited(
+            X: fx.Pointer,
+            Y: fx.Pointer,
+            expert_mask: fx.Pointer,
+            topk_ids: fx.Pointer,
+            topk_weights: fx.Pointer,
+            num_valid_ids: fx.Pointer,
+            i32_m_tokens: fx.Int32,
+            stream: fx.Stream,
+        ):
+            reduction_kernel(
+                X,
+                Y,
+                expert_mask,
+                topk_ids,
+                topk_weights,
+                num_valid_ids,
+                i32_m_tokens,
+            ).launch(grid=(persistent_cus, gy, 1), block=(block, 1, 1), stream=stream)
+
+        return launch_limited
 
     @flyc.jit
     def launch(
@@ -278,12 +339,15 @@ def compile_moe_reduction(
         i32_m_tokens: fx.Int32,
         stream: fx.Stream,
     ):
+        # The original public launcher ABI remains unchanged. The dummy pointer
+        # is never dereferenced when this compile-time count bound is disabled.
         reduction_kernel(
             X,
             Y,
             expert_mask,
             topk_ids,
             topk_weights,
+            topk_ids,
             i32_m_tokens,
         ).launch(
             grid=(fx.Int64(i32_m_tokens), gy, 1), block=(block, 1, 1), stream=stream

@@ -14,6 +14,7 @@
 #include "quant.h"
 #include "mx_quant_utils.h"
 #include "rocprim/rocprim.hpp"
+#include <algorithm>
 #include <cstdlib>
 
 
@@ -58,8 +59,9 @@ constexpr int kDynGqTdmKPT            = 2;  // staged steps per block
 // something arch-specific (wave32, b128 as the widest per-lane access). Nothing was
 // measured on gfx950, so that target keeps the shape it had before.
 template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32, int32_t group_size = 128, bool shuffle_scale = true, int32_t block_size = 64, bool emit_e8m0_scale = false, bool enable_tdm = false, int tdm_tile_rows = 0, bool packed_bf16_amax = false, bool full_group_stores = false, bool wide_group_stores = false, bool grid_2d = false, bool direct_prefetch = false>
-__global__ void __launch_bounds__(block_size)
-dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
+__device__ __forceinline__ void
+dynamic_per_group_scaled_quant_tile(int64_t logical_block,
+                                      DTYPE_O* __restrict__ out,
                                       float* __restrict__ scale,
                                       DTYPE_I const* __restrict__ input,
                                       float const* __restrict__ scale_ub,
@@ -95,7 +97,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     static constexpr int num_thread_per_group = group_size / thread_data_size;
     const int lane_in_group  = threadIdx.x % num_thread_per_group;
     // Reused at the end as the scale-store index, which the shuffled layouts rewrite.
-    int64_t groupId          = static_cast<int64_t>(blockIdx.x) * block_size / num_thread_per_group
+    int64_t groupId          = logical_block * block_size / num_thread_per_group
                                + threadIdx.x / num_thread_per_group;
     int32_t scaleN           = ori_cols / group_size;
     // Shuffle tiles e8m0 bytes 8-wide along scaleN for the MX hardware
@@ -564,7 +566,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         const bool issuer  = (wave_id == 0);
 
         // Tile t of this wave starts at group base + t * kTdmGroupsPerStep.
-        const int64_t block_g0 = static_cast<int64_t>(blockIdx.x) * kTdmGroupsPerBlock;
+        const int64_t block_g0 = logical_block * kTdmGroupsPerBlock;
         const int64_t win_g0  = block_g0;                       // one window for the block
         const int64_t wave_g0 = block_g0 + wave_id * kGroupsPerWave;
         int64_t x0;
@@ -657,6 +659,59 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         if(!resolve(groupId, x, y))
             return;
         process(gather(input + x * ori_row_stride + y * group_size), x, y, groupId);
+    }
+}
+
+// Both launch policies use the same quantization tile, including MX rounding,
+// saturation, scale encoding and vector stores. The default specialization
+// retains the original one-tile-per-CTA execution.
+template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32, int32_t group_size = 128, bool shuffle_scale = true, int32_t block_size = 64, bool emit_e8m0_scale = false, bool enable_tdm = false, int tdm_tile_rows = 0, bool packed_bf16_amax = false, bool full_group_stores = false, bool wide_group_stores = false, bool grid_2d = false, bool direct_prefetch = false, bool persistent = false>
+__global__ void __launch_bounds__(block_size)
+dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
+                                      float* __restrict__ scale,
+                                      DTYPE_I const* __restrict__ input,
+                                      float const* __restrict__ scale_ub,
+                                      int64_t ori_rows,
+                                      int32_t ori_cols,
+                                      int32_t ori_row_stride,
+                                      int64_t oob_size,
+                                      int32_t const* __restrict__ num_rows = nullptr,
+                                      const int32_t num_rows_factor = 1)
+{
+    static_assert(!persistent || (!enable_tdm && !grid_2d && !direct_prefetch && tdm_tile_rows == 0),
+                  "persistent quant uses the linear unstaged tile");
+    if constexpr(persistent)
+    {
+        int64_t active_rows = ori_rows;
+        if(num_rows != nullptr)
+        {
+            const int64_t requested_rows = static_cast<int64_t>(*num_rows) * num_rows_factor;
+            // Match the physical extent of the original launch even if a
+            // caller supplies an oversized count. Zero work remains graph-safe.
+            active_rows = requested_rows < 0 ? 0 :
+                          (requested_rows < ori_rows ? requested_rows : ori_rows);
+        }
+        static constexpr bool use_e8m0_scale =
+            std::is_same_v<DTYPE_O, opus::fp4_t> || emit_e8m0_scale;
+        static constexpr int num_thread_per_group = group_size / thread_data_size;
+        const int scale_n = ori_cols / group_size;
+        const int scale_n_pad = (use_e8m0_scale && shuffle_scale && group_size == 32)
+                                   ? ((scale_n + 7) / 8 * 8) : scale_n;
+        const int64_t active_threads = active_rows * scale_n_pad * num_thread_per_group;
+        const int64_t active_blocks = (active_threads + block_size - 1) / block_size;
+        for(int64_t logical_block = blockIdx.x; logical_block < active_blocks;
+            logical_block += gridDim.x)
+        {
+            dynamic_per_group_scaled_quant_tile<DTYPE_I, DTYPE_O, thread_data_size, group_size, shuffle_scale, block_size, emit_e8m0_scale, enable_tdm, tdm_tile_rows, packed_bf16_amax, full_group_stores, wide_group_stores, grid_2d, direct_prefetch>(
+                logical_block, out, scale, input, scale_ub, active_rows, ori_cols,
+                ori_row_stride, oob_size);
+        }
+    }
+    else
+    {
+        dynamic_per_group_scaled_quant_tile<DTYPE_I, DTYPE_O, thread_data_size, group_size, shuffle_scale, block_size, emit_e8m0_scale, enable_tdm, tdm_tile_rows, packed_bf16_amax, full_group_stores, wide_group_stores, grid_2d, direct_prefetch>(
+            blockIdx.x, out, scale, input, scale_ub, ori_rows, ori_cols,
+            ori_row_stride, oob_size, num_rows, num_rows_factor);
     }
 }
 
@@ -1370,6 +1425,9 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
     int const rows        = input.numel() / cols;
     int const row_stride  = input.stride(-2);
     int32_t* num_rows_ptr = num_rows.has_value() ? reinterpret_cast<int32_t*>(num_rows->data_ptr()) : nullptr;
+    const char* ep_persist = std::getenv("AITER_MOE_EP_PERSIST");
+    const bool ep_persist_enabled = num_rows_ptr != nullptr && ep_persist != nullptr &&
+                                    ep_persist[0] == '1' && ep_persist[1] == '\0';
 
     AITER_CHECK(cols % group_size == 0, __func__, " cols is not divisible by group_size");
 
@@ -1486,18 +1544,36 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                     auto launch_one = [&](auto tdm_tag, auto blk_tag) {
                     constexpr bool tt = decltype(tdm_tag)::value;
                     constexpr int32_t BS = decltype(blk_tag)::value;
-                    aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, out_t, thread_data_size, _GS, ss, BS, ee, tt>
-                        <<<grid, block, 0, stream>>>(
-                        reinterpret_cast<out_t*>(out.data_ptr()),
-                        reinterpret_cast<float*>(scales.data_ptr()),
-                        reinterpret_cast<input_dtype*>(input.data_ptr()),
-                        nullptr,
-                        rows,
-                        cols,
-                        row_stride,
-                        oob_size,
-                        num_rows_ptr,
-                        num_rows_factor);
+                    auto launch_policy = [&](auto persistent_tag) {
+                        constexpr bool ps = decltype(persistent_tag)::value;
+                        const dim3 policy_grid(ps ? std::min(grid.x, get_num_cu_func() * 4)
+                                                  : grid.x);
+                        aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, out_t, thread_data_size, _GS, ss, BS, ee, tt, 0, false, false, false, false, false, ps>
+                            <<<policy_grid, block, 0, stream>>>(
+                            reinterpret_cast<out_t*>(out.data_ptr()),
+                            reinterpret_cast<float*>(scales.data_ptr()),
+                            reinterpret_cast<input_dtype*>(input.data_ptr()),
+                            nullptr,
+                            rows,
+                            cols,
+                            row_stride,
+                            oob_size,
+                            num_rows_ptr,
+                            num_rows_factor);
+                    };
+                    // Counted EP MXFP8 split quant uses the existing tile arithmetic.
+                    // Retain upstream TDM and generic quant launch policies.
+                    if constexpr(std::is_same_v<out_t, opus::fp8_t> && ee && !ss && _GS == 32 && !tt)
+                    {
+                        if(ep_persist_enabled)
+                            launch_policy(std::true_type{});
+                        else
+                            launch_policy(std::false_type{});
+                    }
+                    else
+                    {
+                        launch_policy(std::false_type{});
+                    }
                     };
                     using BlkTuned = std::integral_constant<int32_t, kBlkTuned>;
                     using Blk64    = std::integral_constant<int32_t, 64>;
@@ -2660,7 +2736,7 @@ void fused_dynamic_mx_quant_moe_sort_hip_bounded(aiter_tensor_t& output,
 // correctness.
 constexpr long MXFP4_MOE_SORT_COALESCED_LDS_WORK_MAX = 700000;
 
-template <int block_size, int num_rows, int thread_data_size = 16, int group_size = 32>
+template <int block_size, int num_rows, int thread_data_size = 16, int group_size = 32, bool persistent = false>
 __global__ void mxfp4_moe_sort_kernel(
     uint8_t* __restrict__ out_scale,
     uint8_t* __restrict__ scale,
@@ -2674,6 +2750,13 @@ __global__ void mxfp4_moe_sort_kernel(
 {
     constexpr int threads_per_row = block_size / num_rows;
     int num_valid_ids_value  = num_valid_ids[0];
+    int work_num_blocks = num_blocks;
+    if constexpr(persistent)
+    {
+        const int64_t active_blocks = num_valid_ids_value > 0
+            ? (static_cast<int64_t>(num_valid_ids_value) + num_rows - 1) / num_rows : 0;
+        work_num_blocks = active_blocks < num_blocks ? static_cast<int>(active_blocks) : num_blocks;
+    }
     int block_idx            = blockIdx.x;
     int row_i                = threadIdx.x / threads_per_row;
     int scale_k              = threadIdx.x % threads_per_row * thread_data_size;
@@ -2730,7 +2813,7 @@ __global__ void mxfp4_moe_sort_kernel(
         constexpr int LDS_STRIDE = lds_cols + LDS_PAD;
         __shared__ uint8_t s_scale[num_rows * LDS_STRIDE];
 
-        for(; block_idx < num_blocks; block_idx += num_tg)
+        for(; block_idx < work_num_blocks; block_idx += num_tg)
         {
             // Skip tiles whose 32 rows are entirely in the padding region
             // (all rows >= num_valid_ids -> all invalid). The output buffer is
@@ -2804,7 +2887,7 @@ __global__ void mxfp4_moe_sort_kernel(
       }
     }
 
-    for(; block_idx < num_blocks; block_idx += num_tg)
+    for(; block_idx < work_num_blocks; block_idx += num_tg)
     {
         int sorted_row = block_idx * num_rows + row_i;
         int token_id_info = num_tokens;
@@ -2847,17 +2930,24 @@ __global__ void mxfp4_moe_sort_kernel(
     AITER_CHECK(BLOCK_SIZE % (MAX_COL /(GROUP_SIZE * THREAD_DATA)) == 0);               \
     int num_blocks = (sorted_ids.size(0) + NUM_ROWS - 1) / NUM_ROWS;                    \
     int blocks_per_cu = 8 * 4 / (BLOCK_SIZE / WARP_SIZE);                               \
-    int num_tg = persistent_mode ? num_cu * blocks_per_cu : num_blocks;                 \
+    int num_tg = persistent_mode ? std::min(num_blocks, num_cu * blocks_per_cu) : num_blocks; \
     dim3 const grid(num_tg);                                                            \
     /* The coalesced-store perf gate is computed inside the kernel from        */       \
-    /* num_blocks + scaleN_pad (no extra launch arg / signature change).       */       \
-    mxfp4_moe_sort_kernel<BLOCK_SIZE, NUM_ROWS, THREAD_DATA, GROUP_SIZE>                \
-        <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                        \
-            reinterpret_cast<uint8_t*>(out_scale.data_ptr()),                           \
-            reinterpret_cast<uint8_t*>(scale.data_ptr()),                               \
-            reinterpret_cast<int32_t*>(sorted_ids.data_ptr()),                          \
-            reinterpret_cast<int32_t*>(num_valid_ids.data_ptr()),                       \
-            token_num, cols, num_blocks, num_tg, topk);
+    /* physical num_blocks + scaleN_pad, preserving the default byte stores.  */       \
+    auto launch_policy = [&](auto persistent_tag) {                                    \
+        constexpr bool ps = decltype(persistent_tag)::value;                           \
+        mxfp4_moe_sort_kernel<BLOCK_SIZE, NUM_ROWS, THREAD_DATA, GROUP_SIZE, ps>          \
+            <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                    \
+                reinterpret_cast<uint8_t*>(out_scale.data_ptr()),                       \
+                reinterpret_cast<uint8_t*>(scale.data_ptr()),                           \
+                reinterpret_cast<int32_t*>(sorted_ids.data_ptr()),                      \
+                reinterpret_cast<int32_t*>(num_valid_ids.data_ptr()),                   \
+                token_num, cols, num_blocks, num_tg, topk);                             \
+    };                                                                                 \
+    if(persistent_mode)                                                                \
+        launch_policy(std::true_type{});                                                \
+    else                                                                               \
+        launch_policy(std::false_type{});
 
 
 #define MXFP4_MOE_SORT_KERNEL_DISPATCH(cols_)                                                  \
@@ -2908,7 +2998,9 @@ void mxfp4_moe_sort_hip(
 )
 {
     const int num_cu = get_num_cu_func();
-    const bool persistent_mode = false;
+    const char* ep_persist = std::getenv("AITER_MOE_EP_PERSIST");
+    const bool persistent_mode = ep_persist != nullptr && ep_persist[0] == '1' &&
+                                 ep_persist[1] == '\0';
     int topk = scale.numel() / ((cols + 31) / 32 * token_num);
 
     HipDeviceGuard device_guard(scale.device_id);

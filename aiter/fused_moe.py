@@ -1285,7 +1285,7 @@ def _fused_moe_impl(
 
     def _resolve_metadata(disable_inline_sort=False):
         metadata = get_2stage_cfgs(
-            get_padded_M(M),  # consider token_num > 1024 as prefill
+            get_padded_M(M),
             model_dim,
             inter_dim,
             E,
@@ -1316,6 +1316,15 @@ def _fused_moe_impl(
             has_stage2_scatter=stage2_scatter is not None,
             has_activation_scales=a1_scale is not None or a2_scale is not None,
             has_num_local_tokens=num_local_tokens is not None,
+            _ep_global_experts=(
+                expert_mask.numel()
+                if expert_mask is not None and expert_mask.ndim == 1
+                else 0
+            ),
+            _ep_persist_enabled=(
+                _counted_ep_persistence_requested(expert_mask, num_local_tokens)
+                and _metadata_transform is None
+            ),
         )
         return (
             metadata if _metadata_transform is None else _metadata_transform(metadata)
@@ -1877,6 +1886,8 @@ class MOEMetadata:
     min_sorted_blocks: int | None = None
     max_sorted_blocks: int | None = None
     full_impl: BoundFusedMoeImpl | None = None
+    # None keeps the counted-EP default; False explicitly selects dense launches.
+    ep_persist: bool | None = None
 
 
 def _needs_swiglu_bias_support(dtype, quant_type):
@@ -1946,6 +1957,8 @@ def _flydsl_stage1_wrapper(
     model_dim_pad: int = 0,
     out_dtype: str | None = None,
     v2_output_layout: bool = False,
+    persist: bool | None = None,
+    cu_num_mul: int = 1,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -1987,6 +2000,8 @@ def _flydsl_stage1_wrapper(
         a1_scale=a1_scale,
         sorted_weights=sorted_weights,
         use_async_copy=True,
+        persist=parsed.get("persist", None) if persist is None else persist,
+        cu_num_mul=cu_num_mul,
         k_batch=parsed.get("k_batch", 1),
         # None, matching stage 2: the int4 registry emits no waves_per_eu key.
         waves_per_eu=parsed.get("waves_per_eu", None),
@@ -2023,6 +2038,8 @@ def _flydsl_stage2_wrapper(
     model_dim_pad: int = 0,
     expert_mask=None,
     topk_ids=None,
+    persist: bool | None = None,
+    cu_num_mul: int | None = None,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -2071,9 +2088,9 @@ def _flydsl_stage2_wrapper(
         sort_block_m=parsed.get("sort_block_m", 0),
         waves_per_eu=parsed.get("waves_per_eu", None),
         use_async_copy=parsed.get("use_async_copy", False),
-        cu_num_mul=parsed.get("cu_num_mul", 1),
+        cu_num_mul=parsed.get("cu_num_mul", 1) if cu_num_mul is None else cu_num_mul,
         b_nt=parsed.get("b_nt", 0),
-        persist=parsed.get("persist", None),
+        persist=parsed.get("persist", None) if persist is None else persist,
         inter_dim_pad=inter_dim_pad,
         model_dim_pad=model_dim_pad,
         bias=bias2,
@@ -2842,6 +2859,16 @@ def _can_reroute_mxfp4_to_flydsl(
     )
 
 
+def _counted_ep_persistence_requested(expert_mask, num_local_tokens):
+    return (
+        os.environ.get("AITER_MOE_EP_PERSIST", "0") == "1"
+        and expert_mask is not None
+        and num_local_tokens is not None
+        and num_local_tokens.dtype == dtypes.i32
+        and num_local_tokens.numel() == 1
+    )
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -2874,6 +2901,8 @@ def get_2stage_cfgs(
     has_stage2_scatter=False,
     has_activation_scales=False,
     has_num_local_tokens=False,
+    _ep_persist_enabled=False,
+    _ep_global_experts=0,
 ):
     gate_mode = GateMode(gate_mode)
     cktile_mxfp4_unsafe = q_dtype_w == dtypes.fp4x2 and inter_dim % 256 != 0
@@ -3287,6 +3316,48 @@ def get_2stage_cfgs(
             f"{keys} in {tune_file}"
         )
 
+    ep_schedule_persist = None
+    ep_shape = (
+        _ep_persist_enabled
+        and is_ep
+        and config_file is None
+        and not bypass_tuned_config
+        and gfx == "gfx950"
+        and cu_num == 256
+        and (model_dim, inter_dim, expert, topk) == (7168, 3072, 48, 6)
+        and dtype == dtypes.bf16
+        and input_dtype in (None, dtypes.bf16)
+        and q_dtype_a == dtypes.fp8
+        and q_dtype_a2 in (None, dtypes.fp8)
+        and q_dtype_w == dtypes.fp4x2
+        and q_type == QuantType.per_1x32
+        and activation == ActivationType.Silu
+        and gate_mode == GateMode.INTERLEAVE
+        and use_g1u1
+        and is_shuffled
+        and weights_shuffled
+        and _ep_global_experts == 384
+        and has_num_local_tokens
+        and not has_stage2_scatter
+        and not has_activation_scales
+        and not doweight_stage1
+        and not has_stage1_bias
+        and not has_stage2_bias
+        and hidden_pad == intermediate_pad == 0
+    )
+    if ep_shape:
+        # Fused FP8 avoids intermediate quantization; atomic G2 avoids a
+        # capacity * topk * model_dim reduction workspace.
+        cfg = dict(
+            block_m=64,
+            ksplit=0,
+            run_1stage=False,
+            kernelName1="flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w3_bnt0_gui_fp8",
+            kernelName2="flydsl_moe2_afp8_wfp4_bf16_t64x128x256_atomic",
+        )
+        ep_schedule_persist = True
+        logger.info(f"[fused_moe] using counted EP FP8 atomic kernels for {keys}")
+
     # The asm 1-stage kernels are compiled only for Silu/Gelu
     if (
         cfg is not None
@@ -3542,6 +3613,7 @@ def get_2stage_cfgs(
             fuse_quant=_fuse_quant,
             stage2_has_bias=enable_bias and (is_flydsl2 or is_cktile2),
             skip_inter_quant="_moe2_layout_" in str(kernelName2),
+            ep_persist=ep_schedule_persist,
             **route_bucket_metadata,
         )
     # CK-Tile's 2-stage MXFP4 stage-2 (moe_cktile2stages_gemm2) reduces over
@@ -3995,8 +4067,9 @@ def fused_moe_2stages(
     config_situ_beta, config_situ_linear_beta, normalized_swiglu_limit = (
         _normalize_mxfp4_activation_params(activation, beta, linear_beta, swiglu_limit)
     )
+    # Layout-changing EP policies are selected before sorting by the outer dispatcher.
     metadata = get_2stage_cfgs(
-        get_padded_M(token_num),  # consider token_num > 1024 as prefill
+        get_padded_M(token_num),
         model_dim,
         inter_dim,
         E,
@@ -4022,6 +4095,8 @@ def fused_moe_2stages(
         and getattr(w2, "is_shuffled", False),
         config_file=_metadata_config_file,
         input_dtype=hidden_states.dtype,
+        has_activation_scales=a1_scale is not None or a2_scale is not None,
+        has_num_local_tokens=num_local_tokens is not None,
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
@@ -4095,6 +4170,7 @@ def fused_moe_2stages(
                 block_size=block_size_M,
                 sorted_weights=sorted_weights,
                 num_experts_upper_bound=routing_num_experts,
+                num_rows=num_local_tokens,
             )
 
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
@@ -4150,7 +4226,8 @@ def fused_moe_2stages(
         and q_dtype_a == dtypes.bf16
         and getattr(metadata.stage1, "func", metadata.stage1) is _flydsl_stage1_wrapper
     )
-    if _is_a16w4_port:
+    # Fused quantization owns its packed output; avoid an unused BF16 allocation.
+    if _is_a16w4_port or metadata.fuse_quant:
         a2 = None
     elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         ratio = a1_scale.element_size() // a1.element_size()
@@ -4171,6 +4248,17 @@ def fused_moe_2stages(
     need_bias_support = _needs_swiglu_bias_support(dtype, quant_type)
     stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
     stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
+    if (
+        _counted_ep_persistence_requested(expert_mask, num_local_tokens)
+        and q_dtype_a in (dtypes.fp8, dtypes.fp4x2)
+        and q_dtype_w == dtypes.fp4x2
+    ):
+        # Preserve an explicit per-pair dense policy and caller overrides.
+        persist = True if metadata.ep_persist is None else metadata.ep_persist
+        if stage1_func is _flydsl_stage1_wrapper:
+            extra_stage1_args.setdefault("persist", persist)
+        if stage2_func is _flydsl_stage2_wrapper:
+            extra_stage2_args.setdefault("persist", persist)
     if not metadata.run_1stage and need_bias_support:
         if metadata.has_bias:
             extra_stage1_args["bias1"] = _normalize_bias_for_kernel(bias1)
@@ -4310,6 +4398,7 @@ def fused_moe_2stages(
                 block_size=block_size_M,
                 sorted_weights=sorted_weights,
                 num_experts_upper_bound=routing_num_experts,
+                num_rows=num_local_tokens,
             )
             a2 = a2.view(token_num, topk, -1)
         else:

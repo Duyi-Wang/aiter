@@ -111,6 +111,7 @@ def compile_mixed_moe_gemm1_common(
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
     persist_m: int = 1,
+    cu_num_mul: int = 1,
     use_async_copy: bool = False,
     waves_per_eu: int = 4,
     k_batch: int = 1,
@@ -122,7 +123,12 @@ def compile_mixed_moe_gemm1_common(
     shared_expert_id: int | None = None,
     v2_output_layout: bool = False,
 ):
-    """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
+    """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T).
+
+    ``persist_m <= 0`` uses a fixed CU-sized grid and schedules the live M/N
+    tiles from device ``num_valid_ids``. Positive values retain the legacy
+    fixed number of consecutive M tiles per workgroup.
+    """
     heterogeneous_b = shared_expert_id is not None
     if heterogeneous_b and shared_expert_id != experts - 1:
         raise ValueError(
@@ -133,6 +139,16 @@ def compile_mixed_moe_gemm1_common(
 
     def _al(x, a):
         return (int(x) + int(a) - 1) // int(a) * int(a)
+
+    if not isinstance(cu_num_mul, int) or cu_num_mul < 1:
+        raise ValueError(f"cu_num_mul must be int >= 1, got {cu_num_mul}")
+    persistent = persist_m <= 0
+    if persistent:
+        from aiter.jit.utils.chip_info import get_cu_num
+
+        persistent_cus = get_cu_num() * cu_num_mul
+    else:
+        persistent_cus = 0
 
     if a_dtype not in ("fp8", "fp4"):
         raise ValueError(f"a_dtype must be one of ('fp8','fp4'), got {a_dtype!r}")
@@ -269,10 +285,11 @@ def compile_mixed_moe_gemm1_common(
     # ABI v33 adds four runtime SiTUv2 beta scalars; heterogeneous ABI tracks one
     # version ahead of the ordinary kernel.
     kernel_version = 34 if heterogeneous_b else 33
+    pm_tag = f"_persist_cu{persistent_cus}" if persistent else f"_pm{persist_m}"
     lds_wait_tag = "_sync_lds" if sync_lds_turnover else ""
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}{lds_wait_tag}_v{kernel_version}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{pm_tag}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}{lds_wait_tag}_v{kernel_version}"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -508,7 +525,32 @@ def compile_mixed_moe_gemm1_common(
             by = gpu.block_id("x")
             bx_persist = gpu.block_id("y")
 
-            if const_expr(xcd_swizzle > 0):
+            if const_expr(persistent):
+                # Flatten M/N work over resident CTAs. Launch geometry depends
+                # only on hardware, never the padded routing-buffer capacity.
+                persistent_worker = by
+                if const_expr(xcd_swizzle > 0 and persistent_cus % 8 == 0):
+                    persistent_worker = (by % arith.index(8)) * arith.index(
+                        persistent_cus // 8
+                    ) + by // arith.index(8)
+                inter_pad_idx = arith.index(2 * inter_dim_pad)
+                tile2_pad = 0
+                if const_expr(not gate_only):
+                    tile_k_stage2 = tile_k // 2
+                    tile2_pad = (
+                        tile_k_stage2 - (inter_dim - inter_dim_pad) % tile_k_stage2
+                    ) % tile_k_stage2
+                logical_n = n_in - inter_pad_idx + arith.index(tile2_pad)
+                if const_expr(mock_gate_only or gate_up_interleave):
+                    persistent_n_tiles = (
+                        logical_n + arith.index(tile_n - 1)
+                    ) // arith.index(tile_n)
+                else:
+                    persistent_n_tiles = (
+                        logical_n + arith.index(2 * tile_n - 1)
+                    ) // arith.index(2 * tile_n)
+
+            if const_expr(xcd_swizzle > 0 and not persistent):
                 num_xcds = 8
                 one = arith.constant(1, index=True)
                 tile_n_idx = arith.constant(tile_n, index=True)
@@ -610,6 +652,10 @@ def compile_mixed_moe_gemm1_common(
             num_valid_i32 = buffer_ops.buffer_load(
                 numids_rsrc, arith.constant(0, index=True), vec_width=1, dtype=T.i32
             )
+            if const_expr(persistent):
+                # The bound is uniform across lanes and can change between
+                # graph replays without a host read or a new launch shape.
+                num_valid_i32 = rocdl.ReadfirstlaneOp(T.i32, num_valid_i32).res
 
             sx_rsrc = 1
             sw_rsrc = 1
@@ -671,10 +717,19 @@ def compile_mixed_moe_gemm1_common(
                 sort_scale_nbytes = fx.Int32(sort_padded_rows * sort_padded_cols)
                 sorted_scale_rsrc = ptr_rsrc(arg_out_scale_sorted, sort_scale_nbytes)
 
-            PERSIST_M = persist_m
-            c_pm = arith.constant(PERSIST_M, index=True)
-            # Per-iteration state, rebound by _persist_iter each pass so the
-            # closures below see the current iteration's values.
+            if const_expr(persistent):
+                num_valid_idx = fx.Index(num_valid_i32)
+                live_m_tiles = (
+                    num_valid_idx + arith.constant(sort_block_m - 1, index=True)
+                ) // arith.constant(sort_block_m, index=True)
+                persist_begin = fx.Index(persistent_worker)
+                persist_end = live_m_tiles * persistent_n_tiles
+                persist_step = arith.constant(persistent_cus, index=True)
+            else:
+                c_pm = arith.constant(persist_m, index=True)
+                persist_begin = arith.constant(0, index=True)
+                persist_end = c_pm
+                persist_step = arith.constant(1, index=True)
             bx = bx_m = bx_m_i32 = blk_valid = None
             expert_i32 = expert_idx = exp_valid = is_shared_expert = None
 
@@ -2753,9 +2808,15 @@ def compile_mixed_moe_gemm1_common(
                         moe_gemm1_body()
 
             def _persist_iter(mi_p):
-                nonlocal bx, bx_m, bx_m_i32, blk_valid
+                nonlocal bx, bx_m, bx_m_i32, blk_valid, by_n
                 nonlocal expert_i32, expert_idx, exp_valid, is_shared_expert
-                bx = bx_persist * c_pm + mi_p
+                if const_expr(persistent):
+                    bx = mi_p // persistent_n_tiles
+                    by_n = (mi_p % persistent_n_tiles) * arith.constant(
+                        tile_n, index=True
+                    )
+                else:
+                    bx = bx_persist * c_pm + mi_p
                 bx_m = bx * arith.constant(sort_block_m, index=True)
                 bx_m_i32 = fx.Int32(bx_m)
                 blk_valid = fx.Uint32(bx_m_i32) < fx.Uint32(num_valid_i32)
@@ -2771,15 +2832,12 @@ def compile_mixed_moe_gemm1_common(
                 _gemm1_dispatch()
                 gpu.barrier()
 
-            c0_p = arith.constant(0, index=True)
-            c1_p = arith.constant(1, index=True)
-
             @flyc.jit
             def _run_persist():
                 # init=[] keeps the index-typed induction variable (scf_range),
                 # matching the original scf.ForOp; the plain no-init form would
                 # dispatch to an i32 counter.
-                for mi_p, _ in range(c0_p, c_pm, c1_p, init=[]):
+                for mi_p, _ in range(persist_begin, persist_end, persist_step, init=[]):
                     _persist_iter(mi_p)
 
             _run_persist()
@@ -2901,6 +2959,7 @@ def compile_mixed_moe_gemm1_common(
         inter_dim_pad,
         use_cshuffle_epilog,
         persist_m,
+        persistent_cus,
         use_async_copy,
         waves_per_eu,
         k_batch,
@@ -2963,10 +3022,16 @@ def compile_mixed_moe_gemm1_common(
                 // arith.constant(2, index=True)
             )
 
-        c_pm_l = arith.constant(persist_m, index=True)
-        gy = (
-            fx.Index(i32_size_expert_ids_in) + c_pm_l - arith.constant(1, index=True)
-        ) // c_pm_l
+        if const_expr(persistent):
+            gx = arith.index(persistent_cus)
+            gy = arith.index(1)
+        else:
+            c_pm_l = arith.constant(persist_m, index=True)
+            gy = (
+                fx.Index(i32_size_expert_ids_in)
+                + c_pm_l
+                - arith.constant(1, index=True)
+            ) // c_pm_l
 
         if const_expr(heterogeneous_b):
             launcher = moe_gemm1(

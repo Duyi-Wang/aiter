@@ -104,6 +104,30 @@ def resolve_flydsl_grid_y_persist_m(
     return max(requested_persist_m, required_persist_m)
 
 
+def resolve_flydsl_stage1_persist_m(
+    num_m_blocks: int,
+    requested_persist_m: int = 0,
+    persist: bool | None = None,
+) -> int:
+    """Resolve explicit stage1 persistence without reading device valid counts."""
+    if persist is True or (persist is None and requested_persist_m < 0):
+        return -1
+    return resolve_flydsl_grid_y_persist_m(num_m_blocks, requested_persist_m)
+
+
+def resolve_flydsl_stage2_persist_m(
+    num_m_blocks: int, a_dtype: str, persist: bool | None = None
+) -> int:
+    """Keep default scheduling while honoring explicit persistence for FP8."""
+    if persist is True:
+        return -1
+    if a_dtype == "fp8":
+        return resolve_flydsl_grid_y_persist_m(num_m_blocks)
+    if persist is None and num_m_blocks > 256:
+        return -1
+    return resolve_flydsl_grid_y_persist_m(num_m_blocks, 4 if num_m_blocks > 256 else 1)
+
+
 def requires_flydsl_stage2_reduce(
     token_num: int, model_dim: int, element_size: int
 ) -> bool:
@@ -289,6 +313,18 @@ def get_flydsl_stage1_kernels(
                                             "xcd_swizzle": xcd,
                                             "k_wave": kw,
                                         }
+                                        # Only the shared MX FP8/FP4 builder
+                                        # implements the device-count scheduler.
+                                        # Put persist before optional _kw so
+                                        # quant-output suffix parsing still works.
+                                        if a_dtype in ("fp8", "fp4"):
+                                            persistent_name = base + "_persist"
+                                            if kw > 1:
+                                                persistent_name += f"_kw{kw}"
+                                            kernels[persistent_name] = {
+                                                **kernels[name],
+                                                "persist": True,
+                                            }
     return kernels
 
 
@@ -625,6 +661,7 @@ def compile_flydsl_moe_stage1(
     out_dtype: str,
     act: str = "silu",
     persist_m: int = 1,
+    cu_num_mul: int = 1,
     use_async_copy: bool = False,
     k_batch: int = 1,
     waves_per_eu: int = 3,
@@ -686,6 +723,7 @@ def compile_flydsl_moe_stage1(
             out_dtype=out_dtype,
             act=act,
             persist_m=persist_m,
+            cu_num_mul=cu_num_mul,
             use_async_copy=use_async_copy,
             k_batch=k_batch,
             waves_per_eu=waves_per_eu,
@@ -1021,6 +1059,7 @@ def _run_moe_reduction(
     topk_weights=None,
     fp8_scale_blk=None,
     fp8_pitch_align=None,
+    num_valid_ids=None,
 ):
     """Topk reduction epilogue for stage2 reduce mode."""
     use_mask = expert_mask is not None
@@ -1086,6 +1125,14 @@ def _run_moe_reduction(
         stream = torch.cuda.current_stream()
     # expert_mask is sized by the global expert count (!= w2.shape[0] under EP).
     num_experts = int(expert_mask.numel()) if use_mask else 0
+    use_token_limit = num_valid_ids is not None
+    if use_token_limit and (
+        num_valid_ids.dtype != torch.int32 or num_valid_ids.numel() < 2
+    ):
+        raise ValueError(
+            "Persistent EP reduction requires int32 num_valid_ids with "
+            "[sorted route rows, live packed token rows]"
+        )
     reduce_exe = compile_moe_reduction(
         topk=topk,
         model_dim=model_dim,
@@ -1096,6 +1143,7 @@ def _run_moe_reduction(
         use_weight=use_weight,
         scale_blk=fp8_scale_blk if is_fp8 else None,
         pitch_align=fp8_pitch_align if is_fp8 else None,
+        use_token_limit=use_token_limit,
     )
     _run_compiled(
         reduce_exe,
@@ -1105,6 +1153,7 @@ def _run_moe_reduction(
             ptr_arg(em),
             ptr_arg(tk),
             ptr_arg(tw),
+            *((ptr_arg(num_valid_ids),) if use_token_limit else ()),
             token_num,
             stream,
         ),
@@ -1435,6 +1484,8 @@ def _flydsl_moe_stage1_impl(
     a1_scale: torch.Tensor | None = None,
     sorted_weights: torch.Tensor | None = None,
     persist_m: int = 0,
+    persist: bool | None = None,
+    cu_num_mul: int = 1,
     use_async_copy: bool = False,
     k_batch: int = 1,
     k_batch_intra_block: int | None = None,
@@ -1625,7 +1676,7 @@ def _flydsl_moe_stage1_impl(
     )
     _grid_y = min(_dense_blks, _all_blks)
 
-    _persist_m = resolve_flydsl_grid_y_persist_m(_grid_y, persist_m)
+    _persist_m = resolve_flydsl_stage1_persist_m(_grid_y, persist_m, persist)
 
     # Allocate sorted-scale buffer with padding for tiled layout
     scale_cols = inter_dim // 32
@@ -1733,6 +1784,9 @@ def _flydsl_moe_stage1_impl(
     # The injected FHMoE compiler does not implement the v2 sorted-row layout.
     if _v2_output_layout:
         compile_kwargs["v2_output_layout"] = True
+    # Preserve the default injected FHMoE compiler ABI.
+    if cu_num_mul != 1:
+        compile_kwargs["cu_num_mul"] = cu_num_mul
     exe = _compile_kernel(**compile_kwargs)
     _run_compiled(exe, args)
 
@@ -1899,6 +1953,8 @@ def flydsl_moe_stage1(
     a1_scale: torch.Tensor | None = None,
     sorted_weights: torch.Tensor | None = None,
     persist_m: int = 0,
+    persist: bool | None = None,
+    cu_num_mul: int = 1,
     use_async_copy: bool = False,
     k_batch: int = 1,
     k_batch_intra_block: int | None = None,
@@ -1931,6 +1987,11 @@ def flydsl_moe_stage1(
 
     gate_mode controls the gate/up computation strategy (see GateMode enum).
 
+    persist=True schedules live M/N tiles from device num_valid_ids using a
+    fixed CU-sized grid. The default retains legacy persist_m scheduling.
+    cu_num_mul multiplies the resident worker pool;
+    launch size remains independent of routing-buffer capacity.
+
     Returns:
         Basic:                      out
         fuse_quant:                 (out, out_scale_sorted)
@@ -1956,6 +2017,8 @@ def flydsl_moe_stage1(
         a1_scale=a1_scale,
         sorted_weights=sorted_weights,
         persist_m=persist_m,
+        persist=persist,
+        cu_num_mul=cu_num_mul,
         use_async_copy=use_async_copy,
         k_batch=k_batch,
         k_batch_intra_block=k_batch_intra_block,
@@ -2165,16 +2228,7 @@ def _flydsl_moe_stage2_impl(
     else:
         total_sorted = sorted_expert_ids.shape[0] * _sbm
         m_blocks = (total_sorted + tile_m - 1) // tile_m
-    if persist is True:
-        _persist_m = -1
-    elif persist is False:
-        _persist_m = 4 if m_blocks > 256 else 1
-    else:
-        _persist_m = -1 if m_blocks > 256 else 1
-
-    if a_dtype == "fp8":
-        # FP8 uses non-persistent scheduling, so cap grid.y via persist_m.
-        _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
+    _persist_m = resolve_flydsl_stage2_persist_m(m_blocks, a_dtype, persist)
 
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)
@@ -2297,6 +2351,12 @@ def _flydsl_moe_stage2_impl(
             is_fp8=_s2_fp8_inter,
             fp8_scale_blk=_S2_LEGACY_FP8_SCALE_BLK,
             fp8_pitch_align=_S2_LEGACY_FP8_PITCH_ALIGN,
+            num_valid_ids=(
+                num_valid_ids
+                if expert_mask is not None
+                and os.environ.get("AITER_MOE_EP_PERSIST", "0") == "1"
+                else None
+            ),
         )
     return out
 
